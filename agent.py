@@ -22,6 +22,7 @@ CV_CACHE = radar.ROOT / "data" / "cv_cache.json"
 FREE_DOMAINS = {"gmail.com", "hotmail.com", "outlook.com", "yahoo.com", "yahoo.com.ar", "live.com",
                 "icloud.com", "protonmail.com", "hotmail.com.ar", "outlook.es"}
 ACTIVE = ("applied", "conversation", "action_needed", "interview", "offer")
+CONTACT_DAYS = 14  # How far back track() looks for recruiters who wrote first.
 
 APPLY_SCHEMA = {
     "type": "object",
@@ -869,14 +870,86 @@ def resolve_reply(service, job_id: int, answer: str, cfg: dict, remember: bool, 
 
 
 def mark_applied_manually(job_id: int) -> None:
-    """The user applied on their own (e.g. LinkedIn); start following the conversation."""
+    """The user applied on their own (e.g. LinkedIn); follow the conversation without writing to the recruiter."""
     with connect() as db:
-        db.execute("""INSERT INTO applications(job_id,recipient,subject,body,status,channel,sent_at,last_outbound_at,updated_at)
-                      VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET status='sent', channel='manual',
-                      sent_at=excluded.sent_at, last_outbound_at=excluded.last_outbound_at, updated_at=excluded.updated_at""",
+        db.execute("""INSERT INTO applications(job_id,recipient,subject,body,status,channel,sent_at,last_outbound_at,
+                      updated_at,bot_replies)
+                      VALUES(?,?,?,?,?,?,?,?,?,0) ON CONFLICT(job_id) DO UPDATE SET status='sent', channel='manual',
+                      sent_at=excluded.sent_at, last_outbound_at=excluded.last_outbound_at, updated_at=excluded.updated_at,
+                      bot_replies=0""",
                    (job_id, "", "", "", "sent", "manual", now(), now(), now()))
         db.execute("UPDATE jobs SET status='applied', updated_at=? WHERE id=?", (now(), job_id))
-        log_event(db, job_id, "applied", "Te postulaste vos")
+        log_event(db, job_id, "applied", "Te postulaste vos: el agente sigue la conversación pero no responde")
+
+
+def muted_contact(cfg: dict, sender: str, company: str) -> str:
+    """The autopilot.muted_contacts entry (address, domain or company) that matches this recruiter, or ''."""
+    address = parseaddr(sender)[1].lower()
+    domain = address.split("@")[-1]
+    for entry in cfg["autopilot"].get("muted_contacts", []):
+        rule = entry.strip().lower().lstrip("@")
+        if rule and (rule in (address, domain) or domain.endswith("." + rule)
+                     or (len(rule) >= 3 and normalize(rule) in normalize(company or ""))):
+            return entry.strip()
+    return ""
+
+
+def conversation_muted(cfg: dict, app: dict, sender: str = "") -> str:
+    """Why the agent must not write in this conversation (switched off there or recruiter in the list), or ''."""
+    if not app.get("bot_replies", 1):
+        return "desactivado en esta conversación"
+    rule = muted_contact(cfg, sender or app.get("recipient", ""), app.get("company", ""))
+    return f"«{rule}» está en la lista de no responder" if rule else ""
+
+
+def may_reply(cfg: dict, app: dict, sender: str = "") -> bool:
+    return cfg["autopilot"].get("reply_to_recruiters", True) and not conversation_muted(cfg, app, sender)
+
+
+def set_bot_replies(job_id: int, on: bool) -> None:
+    with connect() as db:
+        db.execute("UPDATE applications SET bot_replies=? WHERE job_id=?", (int(on), job_id))
+        log_event(db, job_id, "bot_replies", "El agente vuelve a responder en esta conversación" if on
+                  else "El agente deja de responder en esta conversación")
+
+
+AUTOMATED_SENDERS = ("noreply", "no-reply", "donotreply", "do-not-reply", "notification", "alert", "newsletter",
+                     "digest", "mailer", "marketing", "jobs-listings", "linkedin.com", "indeed.com", "computrabajo",
+                     "bumeran", "zonajobs", "getonbrd", "glassdoor")
+RECRUITING = re.compile(r"reclut|recruit|talent acquisition|selecci[oó]n de personal|b[uú]squeda laboral|"
+                        r"propuesta laboral|oportunidad laboral|job opportunity|tu perfil|your profile|"
+                        r"tu (cv|curr[ií]culum)|your (cv|resume)", re.I)
+
+
+def recruiter_first(message: dict) -> bool:
+    """A person (not a platform or bulk sender) writing about a job that has no application in WorkWorm."""
+    import mail_organizer
+    address = parseaddr(header(message, "From"))[1].lower()
+    if not address or header(message, "List-Unsubscribe") or any(x in address for x in AUTOMATED_SENDERS):
+        return False
+    subject = header(message, "Subject")
+    return bool(mail_organizer.JOB_SUBJECT.search(subject) or RECRUITING.search(subject + "\n" + plain_text(message["payload"])[:3000]))
+
+
+def start_contact(message: dict) -> dict:
+    """Track a recruiter who wrote first: a 'contact' offer whose conversation starts with the agent muted."""
+    name, address = parseaddr(header(message, "From"))
+    address = address.lower()
+    parts = address.split("@")[-1].split(".")
+    core = parts[-3] if len(parts) >= 3 and parts[-2] in ("com", "co", "org", "net", "gob", "edu") else parts[0 if len(parts) < 2 else -2]
+    company = (name or address) if address.split("@")[-1] in FREE_DOMAINS else core.capitalize()
+    at = datetime.fromtimestamp(int(message["internalDate"]) / 1000, timezone.utc).isoformat(timespec="seconds")
+    subject = header(message, "Subject") or "Contacto de reclutador"
+    with connect() as db:
+        db.execute("""INSERT OR IGNORE INTO jobs(source, external_id, title, company, url, status, seen_at, updated_at)
+                      VALUES('contact',?,?,?,?,'conversation',?,?)""",
+                   (message["threadId"], subject, company, mail_link(message["threadId"]), now(), now()))
+        job_id = db.execute("SELECT id FROM jobs WHERE source='contact' AND external_id=?", (message["threadId"],)).fetchone()["id"]
+        db.execute("""INSERT OR IGNORE INTO applications(job_id,recipient,subject,body,status,channel,thread_id,sent_at,
+                      updated_at,bot_replies) VALUES(?,?,?,'','sent','inbound',?,?,?,0)""",
+                   (job_id, address, subject, message["threadId"], at, now()))
+        log_event(db, job_id, "contact", f"Te escribió {address}: el agente sigue la conversación pero no responde")
+    return radar.job(job_id)
 
 
 def check_every_seconds(cfg: dict) -> int:
@@ -977,7 +1050,9 @@ def match_job(sender: str, text: str, apps: list[dict]) -> dict | None:
     return None
 
 
-def handle_inbound(service, cfg: dict, app: dict, message: dict, report: dict) -> None:
+def handle_inbound(service, cfg: dict, app: dict, message: dict, report: dict, may_write: bool = True) -> None:
+    """Classify a recruiter's mail and update the offer. With may_write=False nothing is sent to the recruiter:
+    the user handles that conversation."""
     sender, subject = header(message, "From"), header(message, "Subject")
     text = plain_text(message["payload"])[:6000]
     history = "\n\n".join(f"[{m['at'][:16]} {'YO' if m['direction'] == 'out' else m['sender']}] {m['subject']}\n{m['body'][:1500]}"
@@ -994,8 +1069,12 @@ def handle_inbound(service, cfg: dict, app: dict, message: dict, report: dict) -
         "hay una propuesta económica formal, piden completar una prueba técnica o formulario, o el mensaje es ambiguo. "
         "Si needs_human es true, should_reply=false.\n"
         + ("Este correo es una notificación de LinkedIn: no se puede responder por mail; si requiere respuesta, needs_human=true.\n" if is_linkedin else "")
-        + f"\n=== POSTULACIÓN ===\nCargo: {app['title']}\nEmpresa: {app['company']}\nCV enviado a: {app['recipient']} "
-          f"el {app['sent_at'][:10]}\nEstado actual: {radar.STATUSES[app['status']]}\n\nDescripción del aviso:\n{(app['description'] or '')[:3000]}"
+        + ("" if may_write else "El candidato lleva esta conversación personalmente: should_reply=false, reply_body vacío "
+                                "y needs_human=false. Solo clasificá y resumí.\n")
+        + f"\n=== POSTULACIÓN ===\nCargo: {app['title']}\nEmpresa: {app['company']}\n"
+        + (f"El reclutador ({app['recipient']}) escribió primero; no hubo postulación" if app.get("channel") == "inbound"
+           else f"CV enviado a: {app['recipient']}")
+        + f" el {app['sent_at'][:10]}\nEstado actual: {radar.STATUSES[app['status']]}\n\nDescripción del aviso:\n{(app['description'] or '')[:3000]}"
           f"\n\n=== HISTORIAL ===\n{history or '(sin mensajes)'}\n\n=== CORREO NUEVO ===\nDe: {sender}\nAsunto: {subject}\n\n{text}"
           + "\n\n=== CV ENVIADO ===\n" + cv_texts(cfg).get(next((c["id"] for c in cfg["cvs"] if Path(c["path"]).name == app["cv_file"]), cfg["cvs"][0]["id"]), ""))
     result = llm.ask(system_prompt(cfg), prompt, REPLY_SCHEMA, model=cfg["autopilot"].get("model", "sonnet"))
@@ -1006,18 +1085,22 @@ def handle_inbound(service, cfg: dict, app: dict, message: dict, report: dict) -
                    (message["id"], app["id"] if result["kind"] != "not_related" else None, message["threadId"], "in",
                     sender, subject, text, result["kind"], result["summary"], at))
         if result["kind"] == "not_related":
+            if app.get("source") == "contact":
+                # Opened by recruiter_first() on a false positive: nothing to follow.
+                db.execute("""UPDATE jobs SET status='discarded', updated_at=? WHERE id=?
+                              AND NOT EXISTS (SELECT 1 FROM messages WHERE job_id=?)""", (now(), app["id"], app["id"]))
             return
         db.execute("UPDATE applications SET last_inbound_at=?, updated_at=? WHERE job_id=?", (at, now(), app["id"]))
         log_event(db, app["id"], "inbound", f"{result['kind']}: {result['summary']}")
     report["inbound"] += 1
     link = mail_link(message["threadId"])
-    if result["needs_human"]:
+    if result["needs_human"] and may_write:
         radar.set_status(app["id"], "action_needed", result["needs_human_reason"])
         notify(service, cfg, f"Necesito tu respuesta: {app['company']}",
                f"{app['title']} en {app['company']}\n\n{result['summary']}\n\nMotivo: {result['needs_human_reason']}\n\nHilo: {link}")
         report["action_needed"] += 1
         return
-    if result["should_reply"] and result["reply_body"].strip():
+    if may_write and result["should_reply"] and result["reply_body"].strip():
         to = header(message, "Reply-To") or sender
         reply_subject = subject if subject.lower().startswith(("re:", "rv:")) else f"Re: {subject}"
         raw = build_raw(cfg, to, reply_subject, result["reply_body"], reply_to_id=header(message, "Message-ID"),
@@ -1066,8 +1149,6 @@ def track(service, cfg: dict, report: dict) -> None:
             f"""SELECT j.*, a.recipient, a.thread_id, a.sent_at, a.cv_file FROM jobs j JOIN applications a ON a.job_id=j.id
                 WHERE j.status IN ({','.join('?' * len(ACTIVE))}) AND a.status='sent'""", ACTIVE)]
         seen = {r["gmail_id"] for r in db.execute("SELECT gmail_id FROM messages")}
-    if not apps:
-        return
     pending: list[tuple[dict, dict]] = []
     thread_owner = {}
     for app in apps:
@@ -1080,8 +1161,9 @@ def track(service, cfg: dict, report: dict) -> None:
             if message["id"] not in seen:
                 pending.append((app, message))
                 seen.add(message["id"])
-    # Recruiters often answer from a new thread or another address.
-    oldest = min(radar.parse_time(a["sent_at"]) for a in apps)
+    # Recruiters often answer from a new thread or another address, or write first (CONTACT_DAYS back).
+    oldest = min([radar.parse_time(a["sent_at"]) for a in apps]
+                 + [datetime.now(timezone.utc) - timedelta(days=CONTACT_DAYS)])
     # All mail, not just the inbox: mail_organizer archives job mail out of the inbox.
     query = f"-from:me -in:sent -in:spam -in:trash -in:drafts after:{int(oldest.timestamp())}"
     listing = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
@@ -1093,12 +1175,17 @@ def track(service, cfg: dict, report: dict) -> None:
             continue
         message = service.users().messages().get(userId="me", id=item["id"], format="full").execute()
         app = match_job(header(message, "From"), header(message, "Subject") + "\n" + plain_text(message["payload"]), apps)
+        if not app and recruiter_first(message):
+            app = start_contact(message)
+            apps.append(app)  # Later mail from the same recruiter matches it by address.
         if app:
             pending.append((app, message))
         else:
             with connect() as db:
                 db.execute("INSERT OR IGNORE INTO seen_mail(gmail_id) VALUES(?)", (item["id"],))
-    pending.sort(key=lambda pair: int(pair[1]["internalDate"]))
+    # What the user sent goes first: it mutes the conversation before the recruiter's mail of this same batch
+    # (often the one the user already answered) gets handled.
+    pending.sort(key=lambda pair: (parseaddr(header(pair[1], "From"))[1].lower() != me, int(pair[1]["internalDate"])))
     for app, message in pending:
         sender = parseaddr(header(message, "From"))[1].lower()
         if sender == me:
@@ -1110,17 +1197,19 @@ def track(service, cfg: dict, report: dict) -> None:
                            (message["id"], app["id"], message["threadId"], "out", me, header(message, "Subject"),
                             plain_text(message["payload"])[:4000], "manual", "Enviado desde Gmail", at))
                 db.execute("UPDATE applications SET last_outbound_at=? WHERE job_id=?", (at, app["id"]))
+                # The user took over this conversation: from now on the agent only follows it.
+                if db.execute("UPDATE applications SET bot_replies=0 WHERE job_id=? AND bot_replies=1", (app["id"],)).rowcount:
+                    log_event(db, app["id"], "bot_replies", "Respondiste vos desde Gmail: el agente deja de responder acá")
                 status = db.execute("SELECT status FROM jobs WHERE id=?", (app["id"],)).fetchone()["status"]
             if status == "action_needed":
                 radar.set_status(app["id"], "conversation", "Respondiste vos desde Gmail")
             continue
-        if not cfg["autopilot"].get("reply_to_recruiters", True):
-            continue  # The user answers recruiters (and books interviews) personally.
         if not within(cfg["autopilot"]["reply_hours"]):
             continue  # Process it in reply hours; it stays unseen until then.
         current = radar.job(app["id"])
+        app = {**app, **current, "status": current["status"]}
         try:
-            handle_inbound(service, cfg, {**app, **current, "status": current["status"]}, message, report)
+            handle_inbound(service, cfg, app, message, report, may_write=may_reply(cfg, app, header(message, "From")))
         except llm.LLMError as exc:
             report["errors"].append(f"LLM con correo de {app['company']}: {exc}")
             break
@@ -1137,6 +1226,8 @@ def followups(service, cfg: dict, report: dict) -> None:
                WHERE j.status='applied' AND a.status='sent' AND a.channel='email' AND a.followup_at='' AND a.last_inbound_at=''
                AND a.sent_at < ?""", (limit,))]
     for row in rows:
+        if conversation_muted(cfg, row):
+            continue
         if row["language"] == "en":
             body = (f"Hi,\n\nI'm following up on my application for the {row['title']} position, sent on "
                     f"{row['sent_at'][:10]}. I'm still very interested and happy to share anything else you need.\n\n"

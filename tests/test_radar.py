@@ -520,6 +520,100 @@ class AgentTests(unittest.TestCase):
         self.assertIs(agent.match_job("rrhh@talent.io", "Proceso en Globant", apps), apps[1])
         self.assertIsNone(agent.match_job("jobalerts-noreply@linkedin.com", "Globant", apps))
 
+    def mail(self, gmail_id, thread_id, sender, subject, text):
+        return {"id": gmail_id, "threadId": thread_id, "internalDate": "1790000000000",
+                "payload": {"mimeType": "text/plain", "headers": [
+                    {"name": "From", "value": sender}, {"name": "Subject", "value": subject},
+                    {"name": "Message-ID", "value": f"<{gmail_id}@mail>"}],
+                    "body": {"data": base64.urlsafe_b64encode(text.encode()).decode()}}}
+
+    def recruiter_sends(self, address):
+        raws = [c.kwargs["body"]["raw"] for c in self.msgs.send.call_args_list]
+        return [r for r in raws if address in message_from_bytes(base64.urlsafe_b64decode(r))["To"]]
+
+    def test_muted_conversation_is_followed_but_never_answered(self):
+        job_id = self.add("1", "Python SQL ETL. Enviar CV a cv@acme.com")
+        with patch.object(agent.llm, "ask", return_value=self.decision()):
+            agent.apply(self.service, radar.job(job_id), self.cfg)
+        agent.set_bot_replies(job_id, False)
+        threads = self.service.users.return_value.threads.return_value
+        threads.get.return_value.execute.return_value = {"messages": [
+            self.mail("in1", "t1", "Ana <cv@acme.com>", "Re: Data Engineer", "¿Podés el martes 15hs?")]}
+        self.msgs.list.return_value.execute.return_value = {"messages": []}
+        result = {"kind": "interview_proposed", "summary": "Proponen martes 15hs", "needs_human": True,
+                  "needs_human_reason": "x", "should_reply": True, "reply_body": "Confirmo.",
+                  "interview_at": "2026-10-06T15:00:00-03:00", "interview_link": ""}
+        report = {"inbound": 0, "replied": 0, "interviews": 0, "action_needed": 0, "errors": []}
+        with patch.object(agent.llm, "ask", return_value=result):
+            agent.track(self.service, self.cfg, report)
+        self.assertEqual(len(self.recruiter_sends("cv@acme.com")), 1)  # only the application itself
+        self.assertEqual((report["replied"], report["action_needed"]), (0, 0))
+        self.assertEqual(radar.job(job_id)["status"], "interview")
+
+    def test_writing_from_gmail_mutes_the_conversation(self):
+        job_id = self.add("1", "Python SQL ETL. Enviar CV a cv@acme.com")
+        with patch.object(agent.llm, "ask", return_value=self.decision()):
+            agent.apply(self.service, radar.job(job_id), self.cfg)
+        threads = self.service.users.return_value.threads.return_value
+        question = self.mail("in1", "t1", "Ana <cv@acme.com>", "Re: Data Engineer", "¿Cuál es tu pretensión?")
+        answer = self.mail("me1", "t1", "Ana Pérez <me@example.org>", "Re: Data Engineer", "Hola Ana, te llamo mañana.")
+        answer["internalDate"] = "1790000060000"  # the user answered after the question, both unseen
+        threads.get.return_value.execute.return_value = {"messages": [question, answer]}
+        self.msgs.list.return_value.execute.return_value = {"messages": []}
+        result = {"kind": "question", "summary": "Pregunta la pretensión", "needs_human": False, "needs_human_reason": "",
+                  "should_reply": True, "reply_body": "Mi pretensión es X.", "interview_at": "", "interview_link": ""}
+        report = {"inbound": 0, "replied": 0, "interviews": 0, "action_needed": 0, "errors": []}
+        with patch.object(agent.llm, "ask", return_value=result):
+            agent.track(self.service, self.cfg, report)
+        self.assertEqual(radar.job(job_id)["bot_replies"], 0)
+        self.assertEqual(len(self.recruiter_sends("cv@acme.com")), 1)  # only the application itself
+
+    def test_recruiter_who_writes_first_becomes_a_muted_conversation(self):
+        first = self.mail("r1", "t9", "Laura Gómez <laura@talentco.com.ar>", "Oportunidad laboral: Data Engineer",
+                          "Hola, vi tu perfil y tengo una búsqueda que te puede interesar.")
+        self.msgs.list.return_value.execute.return_value = {"messages": [{"id": "r1", "threadId": "t9"}]}
+        self.msgs.get.return_value.execute.return_value = first
+        result = {"kind": "question", "summary": "Ofrece una búsqueda", "needs_human": False, "needs_human_reason": "",
+                  "should_reply": True, "reply_body": "Gracias, me interesa.", "interview_at": "", "interview_link": ""}
+        report = {"inbound": 0, "replied": 0, "interviews": 0, "action_needed": 0, "errors": []}
+        with patch.object(agent.llm, "ask", return_value=result):
+            agent.track(self.service, self.cfg, report)
+        contact = next(j for j in radar.jobs("all") if j["source"] == "contact")
+        self.assertEqual((contact["company"], contact["recipient"], contact["channel"], contact["bot_replies"]),
+                         ("Talentco", "laura@talentco.com.ar", "inbound", 0))
+        self.assertEqual(contact["status"], "conversation")
+        self.msgs.send.assert_not_called()
+
+    def test_bulk_and_platform_mail_does_not_open_a_conversation(self):
+        alert = self.mail("a1", "t8", "LinkedIn <jobs-noreply@linkedin.com>", "Oportunidad laboral", "Nuevas ofertas")
+        self.assertFalse(agent.recruiter_first(alert))
+        bulk = self.mail("b1", "t7", "Talent <hola@talentco.com>", "Oportunidad laboral", "Newsletter")
+        bulk["payload"]["headers"].append({"name": "List-Unsubscribe", "value": "<mailto:x@talentco.com>"})
+        self.assertFalse(agent.recruiter_first(bulk))
+
+    def test_muted_contacts_block_replies_and_followups(self):
+        cfg = {**self.cfg, "autopilot": {**self.cfg["autopilot"], "muted_contacts": ["acme.com", "Globant"],
+                                         "followup_after_days": 0}}
+        self.assertTrue(agent.conversation_muted(cfg, {"recipient": "rrhh@jobs.acme.com", "company": "X"}))
+        self.assertTrue(agent.conversation_muted(cfg, {"recipient": "a@b.com", "company": "Globant Argentina"}))
+        self.assertFalse(agent.conversation_muted(cfg, {"recipient": "a@b.com", "company": "Otra"}))
+        self.assertFalse(agent.may_reply({**cfg, "autopilot": {"reply_to_recruiters": False}}, {"recipient": "a@b.com"}))
+        job_id = self.add("1", "Python SQL ETL. Enviar CV a cv@acme.com")
+        with patch.object(agent.llm, "ask", return_value=self.decision()):
+            agent.apply(self.service, radar.job(job_id), self.cfg)
+        with radar.connect() as db:
+            db.execute("UPDATE applications SET sent_at='2026-01-01T00:00:00+00:00' WHERE job_id=?", (job_id,))
+        report = {"followups": 0}
+        agent.followups(self.service, cfg, report)
+        self.assertEqual(report["followups"], 0)
+        agent.followups(self.service, {**cfg, "autopilot": {**cfg["autopilot"], "muted_contacts": []}}, report)
+        self.assertEqual(report["followups"], 1)
+
+    def test_manual_application_starts_muted(self):
+        job_id = self.add("1", "Python SQL ETL")
+        agent.mark_applied_manually(job_id)
+        self.assertEqual(radar.job(job_id)["bot_replies"], 0)
+
 
 class GmailExpiryTests(unittest.TestCase):
     def test_revoked_token_raises_gmail_expired_and_cycle_reports_it(self):

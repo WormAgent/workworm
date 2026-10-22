@@ -307,8 +307,24 @@ with settings:
     settings_general, tailoring_tab = st.tabs(["General", "CV, carta, idioma y exclusiones"])
 
 
+def bot_toggle(j: dict, key: str = "bot") -> None:
+    """Switch the agent on/off for one conversation, saying why it stays quiet anyway."""
+    on = bool(j.get("bot_replies", 1))
+    # The stored value is part of the key: both toggles of a conversation (Pipeline and Configuración) redraw fresh.
+    st.toggle("El agente responde y hace seguimiento en esta conversación", value=on, key=f"{key}-{j['id']}-{int(on)}",
+              on_change=agent.set_bot_replies, args=(j["id"], not on))
+    rule = agent.muted_contact(cfg, j.get("recipient") or "", j.get("company") or "")
+    if rule:
+        st.caption(f"Callado igual: «{rule}» está en la lista de no responder (Configuración).")
+    elif on and not pilot.get("reply_to_recruiters", True):
+        st.caption("Callado igual: las respuestas a reclutadores están apagadas para todos (Configuración).")
+
+
 # ---------------- Pipeline ----------------
 with board:
+    if not pilot.get("reply_to_recruiters", True):
+        st.caption("> El agente no responde a ningún reclutador: sigue los correos y actualiza los estados. "
+                   "Se cambia en Configuración → Piloto automático.")
     attention_jobs = [j for j in radar.jobs("action_needed")]
     if attention_jobs:
         st.markdown(f"### [!!] Requieren tu atención · {len(attention_jobs)}")
@@ -450,7 +466,9 @@ with board:
         c1, c2, c3, c4 = row.columns([5, 3, 1.6, 0.9], vertical_alignment="center")
         c1.markdown(f"<div class='row-main'>▸ <b>{j['company'] or 'Empresa sin dato'}</b> — {j['title']}</div>",
                     unsafe_allow_html=True)
-        tags = [{"email": "MAIL", "form": "FORM", "manual": "MANUAL"}.get(j.get("channel"), "")]
+        tags = [{"email": "MAIL", "form": "FORM", "manual": "MANUAL", "inbound": "TE ESCRIBIERON"}.get(j.get("channel"), "")]
+        if stage != "rejected" and agent.conversation_muted(cfg, j):
+            tags.append("BOT CALLADO")
         if j.get("interview_at"):
             tags.append(f"ENTREVISTA {local(j['interview_at'], '%d/%m %H:%M')}")
         kinds = {m["kind"] for m in inbound_by_job.get(j["id"], [])}
@@ -483,6 +501,7 @@ with board:
                                    file_name=Path(j["cv_path"]).name, mime="application/pdf", key=f"cv-{j['id']}")
             if j.get("added_skills"):
                 st.caption("Agregadas a habilidades: " + j["added_skills"])
+            bot_toggle(j)
             st.divider()
             for msg in radar.thread(j["id"]):
                 who = "> YO" if msg["direction"] == "out" else f"< {msg['sender']}"
@@ -838,10 +857,11 @@ with sources_tab:
                "computrabajo": cfg.get("computrabajo", {}).get("enabled", False),
                "bumeran": cfg.get("bumeran", {}).get("enabled", False),
                **{k: cfg.get("remote_boards", {}).get("enabled", False) for k in ("himalayas", "remotive", "jobicy")},
-               "link": True, "linkedin_ext": cfg.get("linkedin_external", {}).get("enabled", True)}
+               "link": True, "linkedin_ext": cfg.get("linkedin_external", {}).get("enabled", True), "contact": True}
     prefixes = {"linkedin_alert": "LinkedIn", "indeed": "Indeed", "getonbrd": "Get on Board",
                 "greenhouse": "greenhouse", "lever": "lever", "computrabajo": "Computrabajo", "bumeran": "Bumeran",
-                "himalayas": "Remotos", "remotive": "Remotos", "jobicy": "Remotos", "link": "Link", "linkedin_ext": "LinkedIn externo"}
+                "himalayas": "Remotos", "remotive": "Remotos", "jobicy": "Remotos", "link": "Link", "linkedin_ext": "LinkedIn externo",
+                "contact": "Te escribieron"}
     rows = []
     for key, (name, how, apply_how) in radar.SOURCES.items():
         problems = [e for e in errors if e.startswith(prefixes[key])]
@@ -902,18 +922,38 @@ with settings_general:
             check_hours = st.number_input("Revisar correos y ofertas cada (horas)", 1, 24, int(pilot.get("check_every_hours", 4)),
                                           help="Al cambiarlo, la tarea de Windows se reprograma sola.")
             headless = st.toggle("Navegador invisible (headless)", value=pilot.get("browser_headless", False))
+            replies = st.toggle("Responder a reclutadores", value=pilot.get("reply_to_recruiters", True),
+                                help="Apagado, el agente igual lee los correos y actualiza los estados, pero no le escribe a nadie.")
+            sends_followups = st.toggle("Mandar seguimientos", value=pilot.get("followups", True))
+            muted = st.text_area("No escribirle nunca a (un correo, dominio o empresa por línea)",
+                                 "\n".join(pilot.get("muted_contacts", [])), height=100,
+                                 placeholder="ana@consultora.com\nglobant.com\nMercado Libre")
             if st.form_submit_button("Guardar"):
+                hours_changed = int(check_hours) != int(pilot.get("check_every_hours", 4))
                 pilot.update(enabled=enabled, max_applications_per_day=int(per_day),
                              followup_after_days=int(followup), apply_hours=list(ah), reply_hours=list(rh),
-                             check_every_hours=int(check_hours), browser_headless=headless)
+                             check_every_hours=int(check_hours), browser_headless=headless,
+                             reply_to_recruiters=replies, followups=sends_followups,
+                             muted_contacts=[line.strip() for line in muted.splitlines() if line.strip()])
                 save_config(cfg)
-                import subprocess
-                subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                str(radar.ROOT / "install_task.ps1")], capture_output=True,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                next_run_text.clear()
+                if hours_changed:
+                    # Re-registering the tasks also re-enables them: only when the interval actually changes.
+                    import subprocess
+                    subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                    str(radar.ROOT / "install_task.ps1")], capture_output=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    next_run_text.clear()
                 st.success("Guardado")
                 st.rerun()
+        st.subheader("Conversaciones con reclutadores")
+        talks = [j for j in pipeline_jobs if j["status"] in agent.ACTIVE]
+        if not talks:
+            st.caption("> Todavía no hay conversaciones activas.")
+        for j in talks:
+            st.markdown(f"**{j['company'] or 'Empresa sin dato'}** — {j['title']}  \n"
+                        f"<span class='row-time'>{j.get('recipient') or 'sin correo'} · {STATUSES[j['status']]}</span>",
+                        unsafe_allow_html=True)
+            bot_toggle(j, key="talk")
         st.subheader("Gmail")
         if not (radar.SECRETS / "credentials.json").exists():
             st.warning("Falta .secrets/credentials.json (ver README).")

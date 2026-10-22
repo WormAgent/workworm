@@ -104,10 +104,20 @@ En cada ciclo (tarea `WorkWorm` o botón **Ejecutar ciclo ahora**), `agent.run()
 
 1. **Busca ofertas** cada `collect_every_hours` horas y completa las descripciones que faltan.
 2. **Postula** dentro de `apply_hours`, hasta el máximo diario. Claude decide si la oferta encaja, elige el CV y redacta el texto. Si el aviso tiene un correo, manda el CV desde Gmail. Si no, completa el formulario en un **Edge aparte** con perfil propio (`data/edge-profile`) y lo cierra al terminar. Si el sitio pide crear cuenta, captcha o un dato que no está en tu perfil, la oferta pasa a «Requiere tu atención».
-3. **Sigue los correos** dentro de `reply_hours`: clasifica las respuestas y contesta en el mismo hilo. Acepta el horario de entrevista que propongan y responde con lo que dice `profile.md`. Ante una propuesta formal, un dato faltante o algo ambiguo, te avisa con un correo `[WorkWorm]`. Con `reply_to_recruiters: false` no contesta: le respondés vos.
-4. **Hace un seguimiento** a los `followup_after_days` días sin respuesta, una sola vez. Con `followups: false` no manda seguimientos.
+3. **Sigue los correos** dentro de `reply_hours`: clasifica las respuestas y contesta en el mismo hilo. Acepta el horario de entrevista que propongan y responde con lo que dice `profile.md`. Ante una propuesta formal, un dato faltante o algo ambiguo, te avisa con un correo `[WorkWorm]`.
+4. **Hace un seguimiento** a los `followup_after_days` días sin respuesta, una sola vez.
 
-Las ofertas de LinkedIn no se autopostulan: quedan en «Postular en LinkedIn» con el link. Te postulás vos, pulsás «Ya me postulé» y el agente sigue la conversación por correo.
+### Cuándo le escribe a un reclutador
+
+El agente siempre lee los correos y actualiza los estados. Que además conteste o mande seguimientos se decide en tres niveles:
+
+- **Para todos**: **Configuración → Piloto automático → Responder a reclutadores** (`reply_to_recruiters`) y **Mandar seguimientos** (`followups`).
+- **Por conversación**: el interruptor del menú `···` de cada postulación en el Pipeline, o la lista **Conversaciones con reclutadores** en Configuración. Las calladas llevan la etiqueta «BOT CALLADO».
+- **Por reclutador o empresa**: **No escribirle nunca a** (`muted_contacts`): un correo, dominio o nombre de empresa por línea.
+
+Las conversaciones que no empezó el agente arrancan calladas: las postulaciones que marcás con «Ya me postulé», las que contestaste vos desde Gmail y las de reclutadores que te escriben sin una postulación de por medio (aparecen con la etiqueta «TE ESCRIBIERON»). Si querés que el agente siga alguna, activala desde su interruptor.
+
+Las ofertas de LinkedIn no se autopostulan: quedan en «Postular en LinkedIn» con el link. Te postulás vos, pulsás «Ya me postulé» y el agente sigue la conversación por correo (callado, salvo que lo actives).
 
 La primera vez, en **Configuración → Abrir Edge del agente**, iniciá sesión en los sitios donde vas a postular (Indeed, Get on Board, Computrabajo, Bumeran) y cerrá la ventana.
 

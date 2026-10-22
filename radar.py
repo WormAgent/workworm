@@ -74,6 +74,8 @@ PIPELINE = ("applied", "conversation", "action_needed", "interview", "offer", "r
 LEGACY_STATUS = {"selected": "new", "draft": "new", "sent": "applied", "replied": "conversation", "no_email": "new"}
 # Every platform the radar reads from: how offers arrive and how the agent applies.
 SOURCES = {
+    "contact": ("Te escribieron", "Reclutadores que te escribieron por correo sin que el agente se postulara",
+                "No se postula: sigue la conversación y no responde, salvo que lo actives en esa conversación"),
     "linkedin_alert": ("LinkedIn", "Alertas de empleo recibidas en Gmail + descripción pública del aviso",
                        "Manual: el agente deja el link listo, te postulás vos y él sigue la conversación"),
     "indeed": ("Indeed Argentina", "Búsqueda con JobSpy (scraping del sitio público)",
@@ -238,6 +240,12 @@ def connect():
                       ("login_url", "TEXT NOT NULL DEFAULT ''"), ("login_google", "INTEGER NOT NULL DEFAULT 0")):
         if name not in columns:
             db.execute(f"ALTER TABLE applications ADD COLUMN {name} {ddl}")
+    if "bot_replies" not in columns:
+        # 1 = the agent may write to the recruiter in this conversation. The ones it did not start (manual
+        # applications, or where the user already wrote from Gmail) start muted.
+        db.execute("ALTER TABLE applications ADD COLUMN bot_replies INTEGER NOT NULL DEFAULT 1")
+        db.execute("""UPDATE applications SET bot_replies=0 WHERE channel='manual' OR job_id IN
+                      (SELECT job_id FROM messages WHERE direction='out' AND kind='manual' AND job_id IS NOT NULL)""")
     for old, new in LEGACY_STATUS.items():
         db.execute("UPDATE jobs SET status=? WHERE status=?", (new, old))
     try:
@@ -771,7 +779,8 @@ def jobs(status: str = "all") -> list[dict]:
     """Jobs joined with their application (if any). `status` may be a status, 'pipeline' or 'all'."""
     query = """SELECT j.*, a.recipient, a.subject AS app_subject, a.sent_at, a.thread_id, a.cv_file,
                       a.last_inbound_at, a.last_outbound_at, a.followup_at, a.interview_at,
-                      a.interview_link, a.note, a.channel, a.cv_path, a.added_skills, a.status AS app_status, a.user_input, a.login_url, a.login_google
+                      a.interview_link, a.note, a.channel, a.cv_path, a.added_skills, a.status AS app_status, a.user_input, a.login_url, a.login_google,
+                      a.bot_replies
                FROM jobs j LEFT JOIN applications a ON a.job_id = j.id WHERE 1=1"""
     args: list = []
     if status == "pipeline":
