@@ -41,7 +41,11 @@ reload_changed_modules()
 from radar import LOCAL_TZ, STATUSES  # noqa: E402
 
 
-st.set_page_config(page_title="WorkWorm", page_icon="🪱", layout="wide")
+ASSETS = Path(__file__).parent / "assets"
+st.set_page_config(page_title="WorkWorm", page_icon=str(ASSETS / "workworm.png"), layout="wide")
+# el gusano de worm-agents.com, inline para que herede el brillo y la animación del encabezado
+WORM_ICON = (ASSETS / "workworm.svg").read_text(encoding="utf-8").replace(
+    "<svg ", "<svg class='worm' width='84' height='84' ", 1)
 st.markdown("""
 <style>
   /* ---- WorkWorm: amber CRT, GRUB boot-menu style ---- */
@@ -204,7 +208,7 @@ week_ago = datetime.now(timezone.utc) - timedelta(days=7)
 
 prediction = cfg.get("branding", {}).get("prediction", "")
 label, _, value = prediction.rpartition(":")
-st.markdown("<div class='hero'><div class='hero-brand'><svg class='worm' width='96' height='36' viewBox='0 0 96 36' xmlns='http://www.w3.org/2000/svg' shape-rendering='crispEdges'><rect x='60' y='0' width='6' height='6' fill='#ffb000'/><rect x='66' y='0' width='6' height='6' fill='#ffb000'/><rect x='72' y='0' width='6' height='6' fill='#ffb000'/><rect x='54' y='6' width='6' height='6' fill='#ffb000'/><rect x='60' y='6' width='6' height='6' fill='#ffb000'/><rect x='66' y='6' width='6' height='6' fill='#ffb000'/><rect x='72' y='6' width='6' height='6' fill='#ffb000'/><rect x='78' y='6' width='6' height='6' fill='#ffb000'/><rect x='12' y='12' width='6' height='6' fill='#ffb000'/><rect x='18' y='12' width='6' height='6' fill='#ffb000'/><rect x='48' y='12' width='6' height='6' fill='#ffb000'/><rect x='54' y='12' width='6' height='6' fill='#ffb000'/><rect x='60' y='12' width='6' height='6' fill='#ffb000'/><rect x='66' y='12' width='6' height='6' fill='#0b0700'/><rect x='72' y='12' width='6' height='6' fill='#ffb000'/><rect x='78' y='12' width='6' height='6' fill='#ffb000'/><rect x='84' y='12' width='6' height='6' fill='#ffb000'/><rect x='6' y='18' width='6' height='6' fill='#ffb000'/><rect x='12' y='18' width='6' height='6' fill='#ffb000'/><rect x='18' y='18' width='6' height='6' fill='#ffb000'/><rect x='24' y='18' width='6' height='6' fill='#ffb000'/><rect x='42' y='18' width='6' height='6' fill='#ffb000'/><rect x='48' y='18' width='6' height='6' fill='#ffb000'/><rect x='54' y='18' width='6' height='6' fill='#ffb000'/><rect x='60' y='18' width='6' height='6' fill='#ffb000'/><rect x='66' y='18' width='6' height='6' fill='#ffb000'/><rect x='72' y='18' width='6' height='6' fill='#ffb000'/><rect x='78' y='18' width='6' height='6' fill='#ffb000'/><rect x='0' y='24' width='6' height='6' fill='#ffb000'/><rect x='6' y='24' width='6' height='6' fill='#ffb000'/><rect x='24' y='24' width='6' height='6' fill='#ffb000'/><rect x='30' y='24' width='6' height='6' fill='#ffb000'/><rect x='36' y='24' width='6' height='6' fill='#ffb000'/><rect x='42' y='24' width='6' height='6' fill='#ffb000'/><rect x='48' y='24' width='6' height='6' fill='#ffb000'/><rect x='54' y='24' width='6' height='6' fill='#ffb000'/><rect x='0' y='30' width='6' height='6' fill='#ffb000'/><rect x='30' y='30' width='6' height='6' fill='#ffb000'/><rect x='36' y='30' width='6' height='6' fill='#ffb000'/><rect x='42' y='30' width='6' height='6' fill='#ffb000'/><rect x='48' y='30' width='6' height='6' fill='#ffb000'/></svg><span class='hero-title'>WORKWORM</span></div>"
+st.markdown("<div class='hero'><div class='hero-brand'>" + WORM_ICON + "<span class='hero-title'>WORKWORM</span></div>"
             + (f"<div class='hero-sub'>-OBJETIVO-</div><div class='hero-pred'>{label.strip()}: <b>{value.strip()}</b></div>"
                if prediction else "") + "</div>", unsafe_allow_html=True)
 
