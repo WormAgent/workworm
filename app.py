@@ -949,22 +949,102 @@ with settings_general:
                     next_run_text.clear()
                 st.success("Guardado")
                 st.rerun()
-        st.subheader("Conversaciones con reclutadores")
         talks = [j for j in pipeline_jobs if j["status"] in agent.ACTIVE]
-        if not talks:
-            st.caption("> Todavía no hay conversaciones activas.")
-        for j in talks:
-            st.markdown(f"**{j['company'] or 'Empresa sin dato'}** — {j['title']}  \n"
-                        f"<span class='row-time'>{j.get('recipient') or 'sin correo'} · {STATUSES[j['status']]}</span>",
-                        unsafe_allow_html=True)
-            bot_toggle(j, key="talk")
-        st.subheader("Gmail")
-        if not (radar.SECRETS / "credentials.json").exists():
-            st.warning("Falta .secrets/credentials.json (ver README).")
-        for role, label in (("main", "Principal: postulaciones y reclutadores"),
-                            ("alerts", "Notificaciones: alertas de LinkedIn y avisos del radar")):
+        silenced = sum(not j.get("bot_replies", 1) for j in talks)
+        with st.expander(f"Conversaciones con reclutadores · {len(talks)}"
+                         + (f" · {silenced} sin agente" if silenced else "")):
+            if not talks:
+                st.caption("> Todavía no hay conversaciones activas.")
+            else:
+                if not pilot.get("reply_to_recruiters", True):
+                    st.caption("Las respuestas a reclutadores están apagadas para todos (arriba): "
+                               "estas casillas cuentan recién cuando las prendas.")
+                st.caption("Destildá una fila para que el agente no responda ni haga seguimiento en esa conversación.")
+                rows = [{"Responde": bool(j.get("bot_replies", 1)),
+                         "Empresa": j["company"] or "Empresa sin dato", "Puesto": j["title"],
+                         "Correo": j.get("recipient") or "sin correo", "Estado": STATUSES[j["status"]],
+                         "Nota": (f"en no responder: {rule}" if (rule := agent.muted_contact(
+                             cfg, j.get("recipient") or "", j.get("company") or "")) else "")}
+                        for j in talks]
+                edited = st.data_editor(rows, hide_index=True, width="stretch", # The stored values are part of the key: a change from Pipeline redraws the table fresh.
+                                        key="talks-" + "".join(str(int(r["Responde"])) for r in rows),
+                                        disabled=["Empresa", "Puesto", "Correo", "Estado", "Nota"],
+                                        column_config={"Responde": st.column_config.CheckboxColumn(width="small")})
+                changed = [(j, row["Responde"]) for j, row in zip(talks, edited)
+                           if row["Responde"] != bool(j.get("bot_replies", 1))]
+                if changed:
+                    for j, on in changed:
+                        agent.set_bot_replies(j["id"], on)
+                    st.rerun()
+        st.subheader("Cuentas y Gmail")
+        creds_file = radar.SECRETS / "credentials.json"
+
+        def upload_credentials(upload) -> None:
+            try:
+                data = json.loads(upload.getvalue())
+            except ValueError:
+                st.error("Ese archivo no es un JSON válido.")
+                return
+            if "installed" not in data:
+                st.error("Ese JSON no es un cliente OAuth de tipo «Desktop app» (le falta la clave «installed»).")
+                return
+            radar.SECRETS.mkdir(exist_ok=True)
+            creds_file.write_bytes(upload.getvalue())
+            st.rerun()
+
+        if not creds_file.exists():
+            st.warning("Paso 1: falta la credencial de Google. En Google Cloud Console creá un proyecto, habilitá Gmail API, "
+                       "configurá la pantalla de consentimiento y creá un cliente OAuth «Desktop app». "
+                       "Descargá su JSON y subilo acá (detalle en el README).")
+            if upload := st.file_uploader("Credencial OAuth (credentials.json)", type="json", key="gcreds-new"):
+                upload_credentials(upload)
+        else:
+            with st.expander("Credencial de Google Cloud"):
+                try:
+                    project = json.loads(creds_file.read_text(encoding="utf-8"))["installed"].get("project_id", "?")
+                except (ValueError, KeyError):
+                    project = "archivo inválido"
+                st.caption(f"Proyecto: {project}. Las cuentas que autorices tienen que estar como usuarios de prueba "
+                           "en ese proyecto, o la app publicada («In production») para que no venza cada 7 días.")
+                if upload := st.file_uploader("Reemplazar credentials.json", type="json", key="gcreds-replace"):
+                    upload_credentials(upload)
+
+        accounts = cfg.setdefault("gmail_accounts", {})
+        main_addr = cfg.get("candidate_email", "")
+        alerts_addr = accounts.get("alerts") or main_addr
+        with st.form("accounts"):
+            name = st.text_input("Tu nombre (firma los correos)", cfg.get("candidate_name", ""))
+            new_main = st.text_input("Cuenta principal: desde acá postulás y hablás con reclutadores", main_addr)
+            same = st.toggle("Las alertas de LinkedIn llegan a esta misma cuenta", value=alerts_addr.lower() == main_addr.lower())
+            new_alerts = st.text_input("Cuenta de alertas (solo si es otra)", "" if alerts_addr.lower() == main_addr.lower() else alerts_addr,
+                                       placeholder="otra.cuenta@gmail.com")
+            notify = st.text_input("Mandarme los avisos del agente a", pilot.get("notify_email", ""),
+                                   help="Vacío: el agente no te manda avisos por correo.")
+            if st.form_submit_button("Guardar cuentas"):
+                new_main = new_main.strip()
+                new_alerts = new_main if same or not new_alerts.strip() else new_alerts.strip()
+                if not name.strip() or "@" not in new_main or "@" not in new_alerts:
+                    st.error("Completá tu nombre y correos válidos.")
+                else:
+                    # A token belongs to one account: changing the address means authorizing again.
+                    for role, old, new in (("main", main_addr, new_main), ("alerts", alerts_addr, new_alerts)):
+                        if old.lower() != new.lower():
+                            (radar.SECRETS / radar.GMAIL_TOKENS[role]).unlink(missing_ok=True)
+                    cfg.update(candidate_name=name.strip(), candidate_email=new_main)
+                    accounts.update(main=new_main, alerts=new_alerts)
+                    pilot["notify_email"] = notify.strip()
+                    save_config(cfg)
+                    gmail_expired.clear()
+                    st.rerun()
+
+        roles = [("main", "Principal: postulaciones y reclutadores")]
+        if radar.gmail_token_role("alerts") == "alerts":
+            roles.append(("alerts", "Alertas de LinkedIn y avisos del agente"))
+        else:
+            roles[0] = ("main", "Postulaciones, reclutadores y alertas de LinkedIn")
+        for role, label in roles:
             address = radar.gmail_account(role)
-            state = "sin conectar"
+            state = "sin conectar" if creds_file.exists() else "falta la credencial (paso 1)"
             try:
                 connected = radar.gmail_service(role=role) is not None
             except radar.GmailExpired:
@@ -975,13 +1055,21 @@ with settings_general:
                 st.success(f"{label} · {address} · conectado")
             else:
                 st.warning(f"{label} · {address} · {state}")
-                if st.button(f"Autorizar {address}", key=f"auth-{role}"):
-                    try:
-                        radar.gmail_service(interactive=True, role=role)
-                        gmail_expired.clear()
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
+            c1, c2 = st.columns(2)
+            if c1.button(f"{'Volver a autorizar' if connected else 'Autorizar'} {address}", key=f"auth-{role}",
+                         disabled=not creds_file.exists(), width="stretch",
+                         help="Se abre Google en el navegador: elegí esa cuenta y aceptá los permisos."):
+                try:
+                    radar.gmail_service(interactive=True, role=role, force=connected)
+                    gmail_expired.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+            token = radar.SECRETS / radar.GMAIL_TOKENS[role]
+            if c2.button("Desconectar", key=f"unauth-{role}", disabled=not token.exists(), width="stretch"):
+                token.unlink(missing_ok=True)
+                gmail_expired.clear()
+                st.rerun()
         st.subheader("Navegador del agente")
         st.write("Para formularios y LinkedIn el agente abre un Edge aparte, con su propio perfil, y lo cierra al terminar. "
                  "Iniciá sesión una vez en ese Edge en Indeed, Get on Board, Computrabajo y Bumeran. LinkedIn no se usa: ahí te postulás vos.")

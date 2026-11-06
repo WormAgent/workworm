@@ -621,9 +621,16 @@ def parse_linkedin_email(plain: str, sent_at: str = "") -> list[dict]:
 GMAIL_TOKENS = {"main": "token_main.json", "alerts": "token.json"}
 
 
+def gmail_token_role(role: str) -> str:
+    """Role whose token serves this one: when alerts arrive at the main inbox, one authorization covers both."""
+    if role == "alerts" and gmail_account("alerts").lower() == gmail_account("main").lower():
+        return "main"
+    return role
+
+
 def gmail_can_modify(role: str = "main") -> bool:
     """Whether the stored token for that inbox already has the gmail.modify permission."""
-    path = SECRETS / GMAIL_TOKENS[role]
+    path = SECRETS / GMAIL_TOKENS[gmail_token_role(role)]
     return path.exists() and "gmail.modify" in path.read_text(encoding="utf-8")
 
 
@@ -638,7 +645,7 @@ class GmailExpired(RuntimeError):
     """Google revoked the stored token (in Testing mode it lasts 7 days); the user must authorize again."""
 
 
-def gmail_service(interactive: bool = False, role: str = "main"):
+def gmail_service(interactive: bool = False, role: str = "main", force: bool = False):
     """Return an authorized Gmail API service for a role, or None until OAuth is configured for it.
     Raises GmailExpired when the stored token can no longer be refreshed."""
     from google.auth.exceptions import RefreshError
@@ -648,12 +655,14 @@ def gmail_service(interactive: bool = False, role: str = "main"):
     from googleapiclient.discovery import build
 
     credentials_path = SECRETS / "credentials.json"
+    role = gmail_token_role(role)
     token_path = SECRETS / GMAIL_TOKENS[role]
     if not credentials_path.exists():
         return None
     # The main inbox also needs gmail.modify (labels/archive for mail_organizer); older tokens keep their own scopes.
     wanted = SCOPES + (["https://www.googleapis.com/auth/gmail.modify"] if role == "main" else [])
-    creds = Credentials.from_authorized_user_file(str(token_path)) if token_path.exists() else None
+    # force: ask Google again even if the stored token still works (e.g. to switch accounts or renew permissions).
+    creds = Credentials.from_authorized_user_file(str(token_path)) if token_path.exists() and not force else None
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())

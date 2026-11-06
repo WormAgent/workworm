@@ -68,15 +68,15 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 
 1. En [Google Cloud Console](https://console.cloud.google.com/), creá un proyecto y habilitá **Gmail API**.
 2. Configurá la pantalla de consentimiento OAuth como usuario externo y agregá tu correo como usuario de prueba.
-3. Creá un cliente OAuth de tipo **Desktop app**, descargá el JSON y guardalo como `.secrets/credentials.json`.
-4. En **Configuración** del tablero, pulsá **Autorizar Gmail en el navegador**. Los tokens quedan en `.secrets/`, fuera de Git.
+3. Creá un cliente OAuth de tipo **Desktop app** y descargá el JSON.
+4. En el tablero, **Configuración → Cuentas y Gmail**: subí ese JSON, escribí tu nombre y tus cuentas, pulsá **Guardar cuentas** y después **Autorizar** en cada una. La credencial y los tokens quedan en `.secrets/`, fuera de Git.
 
 WorkWorm usa dos conexiones (`config.json → gmail_accounts`):
 
 - **`main`**: la cuenta con la que postulás y hablás con reclutadores.
 - **`alerts`**: la que recibe las alertas de LinkedIn y manda los avisos de WorkWorm.
 
-Pueden ser la misma cuenta. Se piden permisos de lectura, redacción y (en `main`) etiquetas. Durante la búsqueda no se envían correos.
+Pueden ser la misma cuenta: en ese caso se autoriza una sola vez. Si cambiás una dirección, su autorización anterior se borra y hay que autorizar la nueva. Se piden permisos de lectura, redacción y (en `main`) etiquetas. Durante la búsqueda no se envían correos.
 
 Mientras la app de Google Cloud esté en modo **Testing**, Google invalida la autorización cada 7 días. Cuando pasa, el tablero muestra «Venció la autorización de Gmail» y el agente no lee ni manda correos hasta que la renueves en **Configuración → Gmail**. Para que no venza, en la pantalla de consentimiento OAuth pulsá **Publish app** (pasa a «In production»). No hace falta que Google la verifique para usarla vos: al autorizar vas a ver el aviso «Google no verificó esta app», elegí **Configuración avanzada → Ir a…**.
 
