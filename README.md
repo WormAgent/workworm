@@ -35,7 +35,7 @@ La versión actual funciona **solo en Windows 10/11**.
 ## Instalación
 
 ```powershell
-git clone https://github.com/WormAgent/workworm.git
+git clone https://github.com/worm-agents/workworm.git
 cd workworm
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -63,6 +63,8 @@ Para que el tablero y el agente arranquen solos al iniciar sesión, registrá la
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 ```
+
+También se puede desde el tablero: si las tareas faltan, están deshabilitadas o apuntan a otra carpeta (por ejemplo, porque moviste el proyecto), arriba aparece un aviso con el botón **Instalar tareas**. Mientras tanto el agente solo corre cuando tocás **Revisar ahora**.
 
 ## Conectar Gmail
 

@@ -192,6 +192,15 @@ def save_config(cfg: dict) -> None:
     radar.CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def ban(company: str) -> None:
+    """Ban a company: never apply there again and drop its pending offers."""
+    if agent.ban_company(cfg, company):
+        save_config(cfg)
+        moved = agent.apply_exclusions(cfg, agent.BAN_STATUSES)
+        st.toast(f"«{company}» baneada · {moved} ofertas pendientes excluidas")
+    st.rerun()
+
+
 cfg = radar.config()
 pilot = cfg["autopilot"]
 all_jobs = radar.jobs("all")
@@ -214,9 +223,13 @@ st.markdown("<div class='hero'><div class='hero-brand'>" + WORM_ICON + "<span cl
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def scheduler_status() -> dict:
+    return agent.scheduler_status()
+
+
 def next_run_text() -> tuple[str, str]:
     """('13:00', 'en 2 h 10 min') for the next scheduled agent run."""
-    when = agent.next_run()
+    when = scheduler_status()["next"]
     if not when:
         return "", ""
     minutes = max(0, int((when - datetime.now(when.tzinfo)).total_seconds() // 60))
@@ -263,6 +276,8 @@ def control_panel():
         at, _ = next_run_text()
         state = ("○ PAUSED" if not pilot_now["enabled"] else
                  "○ SLEEPING · tope del día" if sent_today >= cap and agent.queue_size() else "○ SLEEPING")
+        if not at and scheduler_status()["state"] != "ok":
+            at = "solo a mano"
         left.markdown(f"<div class='status-line'><b>{state}</b> &nbsp;·&nbsp; próxima revisión {at or '—'}</div>",
                       unsafe_allow_html=True)
         if mid.button("▶ REVISAR AHORA", type="primary", width="stretch", key="start-cycle",
@@ -298,6 +313,17 @@ def gmail_expired() -> list[str]:
 
 for notice in dict.fromkeys(gmail_expired()):
     st.error(f"[!!] {notice}")
+
+_sched = scheduler_status()
+if _sched["state"] in ("missing", "moved", "disabled"):
+    _warn, _fix = st.columns([5, 1.4], vertical_alignment="center")
+    _warn.warning(f"[!!] {_sched['detail']} El agente no corre solo: solo cuando tocás «Revisar ahora».")
+    if _fix.button("Instalar tareas", key="install-tasks",
+                   help="Registra en Windows las tareas «WorkWorm» (ciclo del agente) y «WorkWorm - Tablero» "
+                        "para esta carpeta. También las habilita."):
+        ok, out = agent.install_tasks()
+        scheduler_status.clear()
+        (st.success if ok else st.error)(out or ("Tareas instaladas" if ok else "No se pudieron instalar"))
 
 attention =[j for j in all_jobs if j["status"] == "action_needed"]
 manual_jobs = [j for j in all_jobs if j["status"] == "manual"]
@@ -518,6 +544,12 @@ with board:
             if st.button("Mover", key=f"movebtn-{j['id']}") and target != stage:
                 radar.set_status(j["id"], target, "Movida a mano")
                 st.rerun()
+            if j["company"]:
+                if agent.banned_company(j["company"], cfg):
+                    st.caption(f"«{j['company']}» está baneada: no se postula a sus ofertas nuevas.")
+                elif st.button(f"Banear «{j['company']}»", key=f"pipe-ban-{j['id']}",
+                               help="No postular nunca más a esta empresa. Esta conversación queda como está."):
+                    ban(j["company"])
 
 
 # ---------------- Postular en LinkedIn ----------------
@@ -580,6 +612,9 @@ with manual_tab:
         if c4.button("Descartar", key=f"manual-skip-{job['id']}", width="stretch"):
             radar.set_status(job["id"], "discarded")
             st.rerun()
+        if job["company"] and c4.button("Banear empresa", key=f"manual-ban-{job['id']}", width="stretch",
+                                        help=f"No postular nunca más a «{job['company']}» (se deshace en Configuración)."):
+            ban(job["company"])
         d1, d2 = row.columns([3, 2])
         with d1.expander("Ver descripción"):
             st.write(job["description"][:4000])
@@ -622,6 +657,10 @@ with offers_tab:
             if job["status"] != "discarded" and c1.button("Descartar", key=f"discard-{job['id']}"):
                 radar.set_status(job["id"], "discarded")
                 st.rerun()
+            if job["company"] and not agent.banned_company(job["company"], cfg) and c1.button(
+                    f"Banear «{job['company']}»", key=f"ban-{job['id']}",
+                    help="No postular nunca más a esta empresa (se deshace en Configuración)."):
+                ban(job["company"])
             if agent.is_manual(job):
                 if job["status"] != "manual" and c1.button("Mover a «Postular en LinkedIn»", key=f"tomanual-{job['id']}"):
                     radar.set_status(job["id"], "manual")
@@ -736,7 +775,9 @@ with tailoring_tab:
             max_years = st.number_input("Máximo de años de experiencia que puede pedir el aviso (0 = sin límite)", 0, 15,
                                         int(ex.get("max_years", 3)),
                                         help="Con 3, se excluye todo aviso que pida 4 años o más (no cuenta si dice «deseable»).")
-            companies = st.text_input("Empresas a excluir (separadas por coma)", ", ".join(ex["companies"]))
+            companies = st.text_input("Empresas baneadas: no se postula nunca a estas (separadas por coma)",
+                                      ", ".join(ex["companies"]),
+                                      help="También se banean con el botón «Banear» en cada oferta. Borrá un nombre para desbanearla.")
             rules = st.text_area("Otras reglas para que Claude descarte ofertas (una por línea)", ex["rules"], height=110,
                                  help="Claude las aplica al leer cada aviso antes de postular.")
             st.markdown("**Nube: solo ecosistema Microsoft**")
@@ -943,10 +984,8 @@ with settings_general:
                 if hours_changed:
                     # Re-registering the tasks also re-enables them: only when the interval actually changes.
                     import subprocess
-                    subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                                    str(radar.ROOT / "install_task.ps1")], capture_output=True,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    next_run_text.clear()
+                    agent.install_tasks()
+                    scheduler_status.clear()
                 st.success("Guardado")
                 st.rerun()
         talks = [j for j in pipeline_jobs if j["status"] in agent.ACTIVE]

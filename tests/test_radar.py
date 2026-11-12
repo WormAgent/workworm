@@ -367,6 +367,21 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.missing_cvs(cfg), [str(en_pdf)])
         self.assertEqual(agent.application_language(en_job, {**cfg, "language": {"mode": "es"}}, "en"), "es")
 
+    def test_ban_company_matches_whole_words_and_skips_pending(self):
+        cfg = {**self.cfg, "exclusions": {"companies": []}}
+        self.assertTrue(agent.ban_company(cfg, "IT"))
+        self.assertFalse(agent.ban_company(cfg, "it"))  # already banned
+        self.assertFalse(agent.ban_company(cfg, "  "))
+        self.assertEqual(agent.banned_company("IT Solutions", cfg), "IT")
+        self.assertEqual(agent.banned_company("Globant", cfg), "")  # «it» inside a word does not count
+        self.assertTrue(agent.ban_company(cfg, "Talent Connect"))
+        self.assertIn("Talent Connect", agent.excluded({"title": "Data Engineer", "company": "Talent-Connect SRL"}, cfg))
+        job = self.add("1", "Python")
+        with radar.connect() as db:
+            db.execute("UPDATE jobs SET company='Talent Connect', status='blocked' WHERE id=?", (job,))
+        self.assertEqual(agent.apply_exclusions(cfg, agent.BAN_STATUSES), 1)
+        self.assertEqual(radar.job(job)["status"], "skipped")
+
     def test_exclusions_from_config_skip_offers_but_not_user_links(self):
         cfg = {**self.cfg, "exclusions": {"title_keywords": ["Lead", "Sr"], "companies": ["Globant"], "rules": ""}}
         self.assertIn("Lead", agent.excluded({"title": "Lead Data Engineer", "company": "Acme"}, cfg))

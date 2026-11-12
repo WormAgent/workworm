@@ -1,6 +1,13 @@
 ﻿$ErrorActionPreference = 'Stop'
-$hours = [double]((Get-Content (Join-Path $PSScriptRoot 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json).autopilot.check_every_hours)
+$hours = 0
+$configPath = Join-Path $PSScriptRoot 'config.json'
+if (Test-Path $configPath) {
+    $hours = [double]((Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json).autopilot.check_every_hours)
+}
 if (-not $hours) { $hours = 4 }
+if (-not (Test-Path (Join-Path $PSScriptRoot '.venv\Scripts\pythonw.exe'))) {
+    throw "Falta el entorno virtual (.venv). Crealo primero: python -m venv .venv"
+}
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 

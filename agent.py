@@ -692,6 +692,32 @@ def required_years(text: str) -> int:
     return found
 
 
+def _words(text: str) -> str:
+    return " " + re.sub(r"[^a-z0-9]+", " ", normalize(text or "")).strip() + " "
+
+
+def banned_company(company: str, cfg: dict) -> str:
+    """The banned name that matches this company as whole words («Globant» matches «Globant S.A.»), or ''."""
+    words = _words(company)
+    for name in exclusions(cfg)["companies"]:
+        if _words(name).strip() and _words(name) in words:
+            return name
+    return ""
+
+
+def ban_company(cfg: dict, company: str) -> bool:
+    """Add a company to the banned list in cfg (caller saves it). False if empty or already banned."""
+    company = (company or "").strip()
+    if not _words(company).strip() or banned_company(company, cfg):
+        return False
+    rules = cfg.setdefault("exclusions", {})
+    rules["companies"] = [*exclusions(cfg)["companies"], company]
+    return True
+
+
+BAN_STATUSES = ("new", "manual", "blocked", "failed")
+
+
 def excluded(job: dict, cfg: dict) -> str:
     """Reason the offer matches a hard exclusion from config (title keyword, company, years, cloud), or ''."""
     rules = exclusions(cfg)
@@ -702,10 +728,9 @@ def excluded(job: dict, cfg: dict) -> str:
         token = " " + re.sub(r"[^a-z0-9]+", " ", normalize(word)).strip() + " "
         if token.strip() and token in title:
             return f"Excluida por palabra en el cargo: «{word}»"
-    company = normalize(job.get("company", ""))
-    for name in rules["companies"]:
-        if normalize(name) and normalize(name) in company:
-            return f"Excluida por empresa: «{name}»"
+    name = banned_company(job.get("company", ""), cfg)
+    if name:
+        return f"Excluida por empresa: «{name}»"
     limit = int(rules.get("max_years") or 0)
     if limit and job.get("description"):
         years = required_years(job["description"])
@@ -1271,18 +1296,61 @@ def progress(step: str, **counters) -> None:
         pass
 
 
-def next_run() -> datetime | None:
-    """Next time Windows Task Scheduler will start the agent (None if the task is missing)."""
+TASK_NAMES = ("WorkWorm", "WorkWorm - Tablero")
+
+
+def scheduler_status() -> dict:
+    """State of the Windows tasks that run the agent and the dashboard.
+
+    {"state": "ok" | "missing" | "disabled" | "moved" | "unknown", "next": datetime | None, "detail": str}.
+    "moved" = the task runs a copy of WorkWorm from another folder (the project was moved or renamed),
+    so it fails or runs the wrong code; install_task.ps1 fixes it.
+    """
     import subprocess
+    script = ("$o = foreach ($n in @(" + ",".join(f"'{n}'" for n in TASK_NAMES) + ")) { "
+              "$t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; "
+              "if ($t) { $i = $t | Get-ScheduledTaskInfo; [pscustomobject]@{name=$n; state=[string]$t.State; "
+              "dir=[string]$t.Actions[0].WorkingDirectory; next=$(if ($i.NextRunTime) { $i.NextRunTime.ToString('o') } else { '' })} } "
+              "else { [pscustomobject]@{name=$n; state='Missing'; dir=''; next=''} } }; "
+              "ConvertTo-Json @($o) -Compress")
     try:
-        out = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
-                              "(Get-ScheduledTaskInfo -TaskName 'WorkWorm').NextRunTime.ToString('o')"],
-                             capture_output=True, text=True, timeout=15,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
-        parsed = datetime.fromisoformat(out)
-        return parsed if parsed.tzinfo else parsed.astimezone()
-    except Exception:
-        return None
+        out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], capture_output=True, text=True,
+                             timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+        tasks = {t["name"]: t for t in json.loads(out)}
+    except Exception as exc:
+        return {"state": "unknown", "next": None, "detail": f"No se pudo leer el Programador de tareas: {exc}"}
+    here = os.path.normcase(os.path.abspath(radar.ROOT))
+    missing = [n for n, t in tasks.items() if t["state"] == "Missing"]
+    if missing:
+        return {"state": "missing", "next": None,
+                "detail": "No están instaladas las tareas automáticas: " + ", ".join(missing) + "."}
+    moved = [n for n, t in tasks.items() if os.path.normcase(os.path.abspath(t["dir"] or ".")) != here]
+    if moved:
+        return {"state": "moved", "next": None,
+                "detail": f"Las tareas apuntan a otra carpeta ({tasks[moved[0]]['dir']}). ¿Moviste el proyecto?"}
+    if tasks["WorkWorm"]["state"] == "Disabled":
+        return {"state": "disabled", "next": None, "detail": "La tarea «WorkWorm» está deshabilitada en Windows."}
+    nxt = None
+    try:
+        nxt = datetime.fromisoformat(tasks["WorkWorm"]["next"])
+        nxt = nxt if nxt.tzinfo else nxt.astimezone()
+    except (TypeError, ValueError):
+        pass
+    return {"state": "ok", "next": nxt, "detail": ""}
+
+
+def install_tasks() -> tuple[bool, str]:
+    """(Re)register the Windows tasks for this folder. Also re-enables them."""
+    import subprocess
+    done = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                           str(radar.ROOT / "install_task.ps1")], capture_output=True, text=True,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return done.returncode == 0, (done.stdout or done.stderr).strip()[-400:]
+
+
+def next_run() -> datetime | None:
+    """Next time Windows Task Scheduler will start the agent (None if the task is missing, disabled or moved)."""
+    return scheduler_status()["next"]
 
 
 def current_progress() -> dict:

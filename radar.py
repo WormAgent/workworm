@@ -161,11 +161,36 @@ def normalize(value: str) -> str:
     return "".join(c for c in value if not unicodedata.combining(c)).lower().strip()
 
 
+_SCHEMA_READY: set[str] = set()
+
+
 @contextmanager
 def connect():
     DB_PATH.parent.mkdir(exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
+    if not DB_PATH.exists():
+        _SCHEMA_READY.discard(str(DB_PATH))
+    # The dashboard (every few seconds) and the agent's cycle share the file: wait for the other
+    # writer instead of failing with "database is locked".
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=30000")
+    try:
+        if str(DB_PATH) not in _SCHEMA_READY:
+            _ensure_schema(db)
+            db.commit()
+            _SCHEMA_READY.add(str(DB_PATH))
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _ensure_schema(db: sqlite3.Connection) -> None:
+    """Tables, added columns and status renames. Runs once per process, not on every connection:
+    these writes were what kept locking the database while a cycle was running."""
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS jobs (
@@ -248,14 +273,6 @@ def connect():
                       (SELECT job_id FROM messages WHERE direction='out' AND kind='manual' AND job_id IS NOT NULL)""")
     for old, new in LEGACY_STATUS.items():
         db.execute("UPDATE jobs SET status=? WHERE status=?", (new, old))
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
 
 
 def target_role(job: dict) -> bool:
